@@ -45,6 +45,8 @@ public class UpdateManager {
     private volatile boolean newAppAvailable = false;
     private volatile String newAppVersion = "";
     private volatile String newAppUrl = "";
+    /** App 包的候选下载源（manifest 的 app.sources），下载前会测速挑最快的 */
+    private volatile String[] newAppSources = new String[0];
     private volatile String newAppSha = "";
     private volatile long newAppSize = 0;
     private volatile int appProgress = 0;
@@ -156,6 +158,7 @@ public class UpdateManager {
                     newAppAvailable = true;
                     newAppVersion = app.optString("versionName", app.optString("version", ""));
                     newAppUrl = app.optString("url", "");
+                    newAppSources = sourcesOf(app);
                     newAppSha = app.optString("sha256", "");
                     newAppSize = app.optLong("size", 0);
                 }
@@ -183,6 +186,7 @@ public class UpdateManager {
             }
             if (deltaEntry != null && !deltaEntry.optString("url", "").isEmpty()) {
                 String dUrl = deltaEntry.optString("url", "");
+                String[] dUrls = sourcesOf(deltaEntry);
                 String dSha = deltaEntry.optString("sha256", "");
                 long dSize = deltaEntry.optLong("size", 0);
                 File dDir = new File(context.getFilesDir(), "db");
@@ -193,7 +197,7 @@ public class UpdateManager {
                 ensureNotifPermission();
                 DownloadService.start(context, "正在下载题库更新");
                 set("downloading", 0, "开始下载增量 " + humanSize(dSize));
-                String dGot = download(dUrl, dTmp, dSha, dSize);
+                String dGot = download(dUrls, dTmp, dSha, dSize);
                 if (dGot == null) return;
                 set("verifying", 100, "校验中…");
                 if (!dSha.isEmpty() && !dSha.equalsIgnoreCase(dGot)) {
@@ -211,6 +215,7 @@ public class UpdateManager {
             JSONObject full = tiku.optJSONObject("full");
             if (full == null) { set("error", 0, "manifest 缺 full 段"); return; }
             String url = full.optString("url", "");
+            String[] fUrls = sourcesOf(full);
             String sha = full.optString("sha256", "");
             total = full.optLong("size", 0);
             if (url.isEmpty()) { set("error", 0, "full.url 为空"); return; }
@@ -223,7 +228,7 @@ public class UpdateManager {
             ensureNotifPermission();
             DownloadService.start(context, "正在下载题库");
             set("downloading", 0, "开始下载 " + humanSize(total));
-            String gotSha = download(url, tmp, sha, total);
+            String gotSha = download(fUrls, tmp, sha, total);
             if (gotSha == null) return;   // download() 内已 set error
 
             set("verifying", 100, "校验中…");
@@ -334,7 +339,160 @@ public class UpdateManager {
     private volatile long shown = 0;
     private static final long DL_PARALLEL_MIN = 2L * 1024 * 1024;   // 小于 2MB 单流就够
 
-    private String download(String url, File dest, String expectSha, long sizeHint) {
+    /* ================= 下载源选择 ================= */
+
+    /*
+     * 为什么要有这一段：
+     * manifest 里同一个文件有好几个镜像 —— 直连 github.com、gh-proxy 公共反代、
+     * jsDelivr。它们的速度完全不在一个量级，而且会变。
+     *
+     * 实测同机同文件（86 MB 的 tiku_app.db.gz）：
+     *   直连 release-assets.githubusercontent.com   8.78 MB/s
+     *   gh-proxy（走代理）                           3.24 ~ 4.80 MB/s
+     *   gh-proxy（不走代理）                         0.15 MB/s
+     * 而且 gh-proxy 是"它自己去 GitHub 拉"，你自己开的代理只覆盖"你→gh-proxy"
+     * 这一段，拉不动对面机房。所以固定死用某一个源，就是听天由命。
+     *
+     * 做法：下载前对每个源发一个 256 KB 的 Range 请求并发探速，用最快的那个。
+     * 探测很快（快的源毫秒级返回），慢的源最多等 5 秒就被放弃。
+     */
+
+    private static final int PROBE_BYTES = 256 * 1024;
+    private static final long PROBE_MAX_MS = 5000;
+
+    /** 从 manifest 的一段里取候选下载源：sources[].url 优先，其次 url，最后 mirrors[] */
+    private String[] sourcesOf(JSONObject entry) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (entry == null) return new String[0];
+        JSONArray src = entry.optJSONArray("sources");
+        if (src != null) {
+            for (int i = 0; i < src.length(); i++) {
+                JSONObject o = src.optJSONObject(i);
+                String u = o != null ? o.optString("url", "") : "";
+                if (!u.isEmpty() && !out.contains(u)) out.add(u);
+            }
+        }
+        String primary = entry.optString("url", "");
+        if (!primary.isEmpty() && !out.contains(primary)) out.add(primary);
+        JSONArray mir = entry.optJSONArray("mirrors");
+        if (mir != null) {
+            for (int i = 0; i < mir.length(); i++) {
+                String u = mir.optString(i, "");
+                if (!u.isEmpty() && !out.contains(u)) out.add(u);
+            }
+        }
+        return out.toArray(new String[0]);
+    }
+
+    /** 给 URL 起个短名，给用户看 */
+    private static String sourceName(String url) {
+        if (url == null || url.isEmpty()) return "未知源";
+        if (url.contains("gh-proxy") || url.contains("ghproxy")) return "加速镜像";
+        if (url.contains("jsdelivr")) return "jsDelivr";
+        if (url.contains("githubusercontent") || url.contains("github.com")) return "直连 GitHub";
+        try { return new java.net.URL(url).getHost(); } catch (Throwable t) { return "自定义源"; }
+    }
+
+    /** 探一个源的实际吞吐（MB/s）。拉前 256 KB，最多等 5 秒；失败返回 -1 */
+    private double probe(String url) {
+        HttpURLConnection c = null;
+        try {
+            c = open(url);
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(5000);
+            c.setRequestProperty("Range", "bytes=0-" + (PROBE_BYTES - 1));
+            int code = c.getResponseCode();
+            if (code != 200 && code != 206) return -1;
+            long t0 = System.currentTimeMillis();
+            long got = 0;
+            try (InputStream in = c.getInputStream()) {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while (got < PROBE_BYTES && (n = in.read(buf)) > 0) {
+                    got += n;
+                    if (System.currentTimeMillis() - t0 > PROBE_MAX_MS) break;
+                }
+            }
+            long ms = System.currentTimeMillis() - t0;
+            if (got <= 0 || ms <= 0) return -1;
+            return (got / 1048576.0) / (ms / 1000.0);
+        } catch (Throwable t) {
+            return -1;
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    /** 并发探所有源，按吞吐从高到低排。全失败就返回原顺序（交给下载阶段去试错） */
+    private String[] orderSources(String[] urls) {
+        java.util.List<String> cand = new java.util.ArrayList<>();
+        if (urls != null) {
+            for (String u : urls) if (u != null && !u.isEmpty() && !cand.contains(u)) cand.add(u);
+        }
+        if (cand.size() <= 1) return cand.toArray(new String[0]);
+
+        final double[] rate = new double[cand.size()];
+        java.util.Arrays.fill(rate, -1);
+        Thread[] ts = new Thread[cand.size()];
+        for (int i = 0; i < cand.size(); i++) {
+            final int idx = i;
+            final String u = cand.get(i);
+            ts[i] = new Thread(new Runnable() {
+                @Override public void run() { rate[idx] = probe(u); }
+            }, "probe-" + i);
+            ts[i].setDaemon(true);
+            ts[i].start();
+        }
+        long deadline = System.currentTimeMillis() + PROBE_MAX_MS + 1500;
+        for (Thread t : ts) {
+            long left = deadline - System.currentTimeMillis();
+            if (left > 0) { try { t.join(left); } catch (InterruptedException ignored) { } }
+        }
+
+        Integer[] idx = new Integer[cand.size()];
+        for (int i = 0; i < idx.length; i++) idx[i] = i;
+        java.util.Arrays.sort(idx, (a, b) -> Double.compare(rate[b], rate[a]));
+
+        StringBuilder sb = new StringBuilder();
+        String[] out = new String[cand.size()];
+        for (int i = 0; i < idx.length; i++) {
+            out[i] = cand.get(idx[i]);
+            if (sb.length() > 0) sb.append("、");
+            double r = rate[idx[i]];
+            sb.append(sourceName(out[i])).append(r > 0 ? String.format(" %.1fMB/s", r) : " 不通");
+        }
+        Log.i(TAG, "测速结果：" + sb);
+        message = "测速：" + sb;
+        return out;
+    }
+
+    /** 挑一个最快的源（不下载） */
+    private String pickSource(String[] urls) {
+        String[] ordered = orderSources(urls);
+        return ordered.length == 0 ? "" : ordered[0];
+    }
+
+    /** 多源下载：按测速顺序逐个试，第一个成功的胜出 */
+    private String download(String[] urls, File dest, String expectSha, long sizeHint) {
+        String[] ordered = orderSources(urls);
+        if (ordered.length == 0) {
+            set("error", progress, "manifest 里没有可用的下载地址");
+            return null;
+        }
+        String lastErr = null;
+        for (String u : ordered) {
+            if (u == null || u.isEmpty()) continue;
+            message = "正在从「" + sourceName(u) + "」下载";
+            Log.i(TAG, "下载源 " + sourceName(u) + " " + u);
+            String r = downloadOne(u, dest, expectSha, sizeHint);
+            if (r != null) return r;
+            lastErr = sourceName(u);
+        }
+        set("error", progress, "所有下载源都失败（最后一个：" + lastErr + "）");
+        return null;
+    }
+
+    private String downloadOne(String url, File dest, String expectSha, long sizeHint) {
         HttpURLConnection c = null;
         try {
             boolean isGz = url.endsWith(".gz");
@@ -383,8 +541,9 @@ public class UpdateManager {
             return sha256Of(dest);
         } catch (Throwable t) {
             if (dest.exists()) dest.delete();
-            set("error", progress, "下载失败：" + t.getMessage());
-            return null;
+            Log.w(TAG, "源 " + sourceName(url) + " 下载失败：" + t.getMessage());
+            message = "「" + sourceName(url) + "」失败，换下一个源…";
+            return null;          // 不在这里 set error —— 上层还有别的源要试
         } finally {
             if (c != null) c.disconnect();
         }
@@ -578,15 +737,19 @@ public class UpdateManager {
         new Thread(() -> {
             File out = new File(context.getCacheDir(), "shangan-update.apk");
             try {
-                long size = newAppSize > 0 ? newAppSize : remoteSize(newAppUrl);
+                String apkUrl = pickSource(newAppSources.length > 0 ? newAppSources : new String[]{newAppUrl});
+                if (apkUrl.isEmpty()) throw new Exception("没有可用的下载源");
+                appState = "downloading";
+                message = "正在从「" + sourceName(apkUrl) + "」下载 App";
+                long size = newAppSize > 0 ? newAppSize : remoteSize(apkUrl);
                 if (size > 0) appTotal = size;
                 File[] parts = size >= DL_PARALLEL_MIN
-                        ? fetchParts(newAppUrl, size, context.getCacheDir(), "shangan-update.apk." + size + ".part", true)
+                        ? fetchParts(apkUrl, size, context.getCacheDir(), "shangan-update.apk." + size + ".part", true)
                         : null;
                 if (parts != null) {
                     if (!assemble(parts, out, false)) throw new Exception("分块合并失败");
                 } else {
-                    HttpURLConnection c = open(newAppUrl);
+                    HttpURLConnection c = open(apkUrl);
                     c.connect();
                     int code = c.getResponseCode();
                     if (code >= 400) throw new Exception("HTTP " + code);
