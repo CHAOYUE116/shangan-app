@@ -35,6 +35,19 @@ public class DownloadService extends Service {
     /** 当前实例；没有下载时是 null */
     private static volatile DownloadService cur;
 
+    /**
+     * 服务正在启动的路上（startForegroundService 已发出，onStartCommand 还没跑到）。
+     *
+     * 为什么需要这个标记：startForegroundService() 之后系统给 5 秒窗口要求
+     * startForeground()。如果我们在窗口内就把任务干完并调 stop()，
+     * 直接 stopSelf 会让系统判定「你起了前台服务却没 startForeground」，
+     * 抛 ForegroundServiceDidNotStartInTimeException 弄崩整个进程。
+     * 所以：还没起来的服务，stop() 只记一笔，等 onStartCommand 里
+     * startForeground 之后再自我了断。
+     */
+    private static volatile boolean starting = false;
+    private static volatile boolean stopWhenStarted = false;
+
     private String title = "正在下载";
     private NotificationManager nm;
 
@@ -42,12 +55,15 @@ public class DownloadService extends Service {
     public static void start(Context ctx, String title) {
         if (ctx == null) return;
         try {
+            starting = true;
+            stopWhenStarted = false;
             Intent i = new Intent(ctx, DownloadService.class);
             i.putExtra(EXTRA_TITLE, title == null ? "正在下载" : title);
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i);
             else ctx.startService(i);
         } catch (Throwable t) {
             // 起不来也不影响下载本身，只是没有保活
+            starting = false;
             Log.w(TAG, "start fail: " + t.getMessage());
         }
     }
@@ -67,7 +83,12 @@ public class DownloadService extends Service {
     public static void stop() {
         DownloadService s = cur;
         cur = null;
-        if (s == null) return;
+        if (s == null) {
+            // 服务还在启动路上：别 stopSelf，否则会触发
+            // ForegroundServiceDidNotStartInTimeException 崩进程
+            if (starting) stopWhenStarted = true;
+            return;
+        }
         try {
             s.stopForeground(true);
         } catch (Throwable ignored) { }
@@ -89,11 +110,20 @@ public class DownloadService extends Service {
             if (t != null && !t.isEmpty()) title = t;
         }
         cur = this;
+        starting = false;
         try {
             ensureChannel();
             startForeground(NOTI_ID, build(0, "准备中…", true));
         } catch (Throwable t) {
             Log.w(TAG, "startForeground fail: " + t.getMessage());
+        }
+        // 启动之前就有人调过 stop()（任务瞬间完成的情形），现在补上
+        if (stopWhenStarted) {
+            stopWhenStarted = false;
+            cur = null;
+            try { stopForeground(true); } catch (Throwable ignored) { }
+            try { stopSelf(); } catch (Throwable ignored) { }
+            return START_NOT_STICKY;
         }
         // 下载由 UpdateManager 的线程负责，进程被杀就重来，不需要系统重启服务
         return START_NOT_STICKY;

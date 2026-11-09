@@ -133,18 +133,37 @@ public class UpdateManager {
         try {
             set("checking", 0, "正在检查更新…");
             localVersion = db.getDbVersion();
-            JSONObject manifest = null;
-            String lastErr = "";
-            for (String u : urls) {
-                try {
-                    manifest = fetchJson(u);
-                    if (manifest != null) break;
-                } catch (Throwable t) {
-                    lastErr = t.getMessage();
-                    Log.w(TAG, "manifest 源失败 " + u + " : " + lastErr);
-                }
+            // 多源并发拉 manifest，谁先回用谁；整体 12 秒封顶。
+            // 串行的话：国外直连不通时，用户要盯着"正在检查更新…"等到超时。
+            final java.util.concurrent.atomic.AtomicReference<JSONObject> got =
+                    new java.util.concurrent.atomic.AtomicReference<>(null);
+            final java.util.concurrent.atomic.AtomicReference<String> err =
+                    new java.util.concurrent.atomic.AtomicReference<>("");
+            Thread[] mts = new Thread[urls.size()];
+            for (int i = 0; i < urls.size(); i++) {
+                final String u = urls.get(i);
+                mts[i] = new Thread(new Runnable() {
+                    @Override public void run() {
+                        if (got.get() != null) return;
+                        try {
+                            JSONObject m = fetchJson(u);
+                            if (m != null) got.compareAndSet(null, m);
+                        } catch (Throwable t) {
+                            err.set(t.getMessage());
+                            Log.w(TAG, "manifest 源失败 " + sourceName(u) + " : " + t.getMessage());
+                        }
+                    }
+                }, "manifest-" + i);
+                mts[i].setDaemon(true);
+                mts[i].start();
             }
-            if (manifest == null) { set("error", 0, "所有更新源都不可达：" + lastErr); return; }
+            long mDeadline = System.currentTimeMillis() + 12000;
+            for (Thread t : mts) {
+                long left = mDeadline - System.currentTimeMillis();
+                if (left > 0) { try { t.join(left); } catch (InterruptedException ignored) { } }
+            }
+            JSONObject manifest = got.get();
+            if (manifest == null) { set("error", 0, "所有更新源都不可达：" + err.get()); return; }
 
             JSONObject tiku = manifest.optJSONObject("tiku");
             if (tiku == null) { set("error", 0, "manifest 缺 tiku 段"); return; }
@@ -313,6 +332,8 @@ public class UpdateManager {
 
     private JSONObject fetchJson(String url) throws Exception {
         HttpURLConnection c = open(url);
+        c.setConnectTimeout(8000);      // manifest 就几 KB，等不了那么久
+        c.setReadTimeout(10000);
         try (InputStream in = c.getInputStream()) {
             java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
             byte[] buf = new byte[8192];
@@ -731,14 +752,27 @@ public class UpdateManager {
         appProgress = 0;
         appDownloaded = 0;
         appTotal = newAppSize;
-        notiPct = -1;
-        ensureNotifPermission();
-        DownloadService.start(context, "正在下载新版 App");
         new Thread(() -> {
             File out = new File(context.getCacheDir(), "shangan-update.apk");
+            File stamp = new File(context.getCacheDir(), "shangan-update.ok");
             try {
+                // 同一个包下过就别下了 —— 之前每次点都重下 135 MB
+                if (out.exists() && out.length() > 0 && stamp.exists()
+                        && newAppSha.equalsIgnoreCase(readText(stamp).trim())) {
+                    appState = "done";
+                    appProgress = 100;
+                    appDownloaded = out.length();
+                    appTotal = out.length();
+                    message = "新版本已经下载过了，直接装";
+                    notifyReadyToInstall(out);
+                    return;
+                }
                 String apkUrl = pickSource(newAppSources.length > 0 ? newAppSources : new String[]{newAppUrl});
                 if (apkUrl.isEmpty()) throw new Exception("没有可用的下载源");
+                // 到这一步才确定要真下载了，此时再起前台服务
+                notiPct = -1;
+                ensureNotifPermission();
+                DownloadService.start(context, "正在下载新版 App");
                 appState = "downloading";
                 message = "正在从「" + sourceName(apkUrl) + "」下载 App";
                 long size = newAppSize > 0 ? newAppSize : remoteSize(apkUrl);
@@ -776,16 +810,19 @@ public class UpdateManager {
                 }
                 if (!newAppSha.isEmpty() && !sha256Of(out).equalsIgnoreCase(newAppSha)) {
                     out.delete();
+                    stamp.delete();
                     appState = "error";
                     message = "新版 App 校验失败，已丢弃";
                     DownloadService.stop();
                     return;
                 }
+                try { writeText(stamp, newAppSha); } catch (Throwable ignored) { }
                 appState = "done";
                 appProgress = 100;
                 if (appTotal > 0) appDownloaded = appTotal;
+                message = "下载完成，点安装";
                 DownloadService.stop();
-                installApk(out);
+                notifyReadyToInstall(out);   // 不直接 startActivity
             } catch (Throwable t) {
                 Log.w(TAG, "downloadApp fail", t);
                 if (out.exists()) out.delete();
@@ -796,24 +833,96 @@ public class UpdateManager {
         }, "app-update").start();
     }
 
-    private void installApk(File apk) {
+    /** 构造安装用的 Intent（FileProvider 授权读） */
+    private android.content.Intent apkIntent(File apk) {
+        android.content.Intent it = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+        android.net.Uri uri;
+        if (android.os.Build.VERSION.SDK_INT >= 24) {
+            uri = androidx.core.content.FileProvider.getUriForFile(
+                    context, context.getPackageName() + ".fileprovider", apk);
+            it.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } else {
+            uri = android.net.Uri.fromFile(apk);
+        }
+        it.setDataAndType(uri, "application/vnd.android.package-archive");
+        it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+        return it;
+    }
+
+    /** 用户点通知时用的 PendingIntent */
+    private android.app.PendingIntent installPendingIntent(File apk) {
+        int flags = android.app.PendingIntent.FLAG_UPDATE_CURRENT;
+        if (android.os.Build.VERSION.SDK_INT >= 23) flags |= android.app.PendingIntent.FLAG_IMMUTABLE;
+        return android.app.PendingIntent.getActivity(context, 2, apkIntent(apk), flags);
+    }
+
+    /**
+     * 下载完了只发通知，不直接拉安装器。
+     *
+     * 原因：Android 10 起禁止后台启动 Activity。后台下载（我们现在就是后台下）
+     * 下完那一刻 App 多半在后台，startActivity 会被系统静默拒绝 ——
+     * 用户看到的就是"下载完了但什么都没发生"。AppUpdate / XUpdate 这些库
+     * 处理这个问题的办法也一样：落通知，用户点了才装。
+     */
+    private void notifyReadyToInstall(File apk) {
         try {
-            android.content.Intent it = new android.content.Intent(android.content.Intent.ACTION_VIEW);
-            android.net.Uri uri;
-            if (android.os.Build.VERSION.SDK_INT >= 24) {
-                uri = androidx.core.content.FileProvider.getUriForFile(
-                        context, context.getPackageName() + ".fileprovider", apk);
-                it.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            } else {
-                uri = android.net.Uri.fromFile(apk);
+            android.app.NotificationManager nm =
+                    (android.app.NotificationManager) context.getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                android.app.NotificationChannel ch = new android.app.NotificationChannel(
+                        "shangan_install", "安装", android.app.NotificationManager.IMPORTANCE_DEFAULT);
+                ch.setShowBadge(true);
+                nm.createNotificationChannel(ch);
             }
-            it.setDataAndType(uri, "application/vnd.android.package-archive");
+            androidx.core.app.NotificationCompat.Builder b =
+                    new androidx.core.app.NotificationCompat.Builder(context, "shangan_install")
+                            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                            .setContentTitle("新版本 " + (newAppVersion.isEmpty() ? "" : newAppVersion) + " 已就绪")
+                            .setContentText("点这里安装（安装过程中 App 会关闭）")
+                            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_DEFAULT)
+                            .setAutoCancel(true)
+                            .setContentIntent(installPendingIntent(apk));
+            nm.notify(10202, b.build());
+        } catch (Throwable t) {
+            Log.w(TAG, "安装通知失败", t);
+        }
+    }
+
+    /** 能不能装：Android 8+ 需要用户允许「安装未知应用」 */
+    private boolean canInstall() {
+        if (android.os.Build.VERSION.SDK_INT < 26) return true;
+        try { return context.getPackageManager().canRequestPackageInstalls(); } catch (Throwable t) { return true; }
+    }
+
+    private void openInstallSettings() {
+        try {
+            android.content.Intent it = new android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    android.net.Uri.parse("package:" + context.getPackageName()));
             it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
             context.startActivity(it);
         } catch (Throwable t) {
+            Log.w(TAG, "打开安装权限设置失败", t);
+        }
+    }
+
+    /** 供前端「立即安装」按钮调用：用户主动点，不受后台启动限制 */
+    @android.webkit.JavascriptInterface
+    public String installApp() {
+        File apk = new File(context.getCacheDir(), "shangan-update.apk");
+        if (!apk.exists() || apk.length() <= 0) return "error: 安装包不在本地，请先下载";
+        if (!canInstall()) {
+            openInstallSettings();
+            return "needPermission";
+        }
+        try {
+            context.startActivity(apkIntent(apk));
+            appState = "installing";
+            message = "已打开安装器";
+            return "ok";
+        } catch (Throwable t) {
             Log.w(TAG, "install fail", t);
-            appState = "error";
-            message = "打开安装器失败：" + t.getMessage();
+            return "error: " + t.getMessage();
         }
     }
 
@@ -839,6 +948,25 @@ public class UpdateManager {
             return context.getPackageManager().getPackageInfo(context.getPackageName(), 0).versionCode;
         } catch (Throwable t) {
             return 0;
+        }
+    }
+
+    private static String readText(File f) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line);
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static void writeText(File f, String s) throws Exception {
+        try (java.io.Writer w = new java.io.OutputStreamWriter(
+                new java.io.FileOutputStream(f), "UTF-8")) {
+            w.write(s == null ? "" : s);
         }
     }
 
