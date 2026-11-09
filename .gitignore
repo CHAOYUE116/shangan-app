@@ -1,0 +1,35 @@
+# ── 构建产物 ────────────────────────────────────────
+build/
+.gradle/
+*.apk
+*.aab
+*.ap_
+release/
+captures/
+
+# Web 资源是构建时从 ../kaogong-shuati/public 同步过来的
+# （里面有两个 300+ MB 的数据库），不入库。
+android/app/src/main/assets/public/
+
+# capacitor 每次 sync 重新生成
+android/capacitor-cordova-android-plugins/
+
+# ── 依赖 ────────────────────────────────────────────
+node_modules/
+
+# ── 本机配置 / 签名 ─────────────────────────────────
+local.properties
+*.jks
+*.keystore
+keystore.properties
+
+# ── IDE / 系统 ──────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 签名口令（跟 keystore 一起留在本机，绝不入库）
+android/keystore-pass.txt
+

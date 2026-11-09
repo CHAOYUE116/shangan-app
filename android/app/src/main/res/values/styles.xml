@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Base application theme. -->
+    <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
+        <!-- Customize your theme here. -->
+        <item name="colorPrimary">@color/colorPrimary</item>
+        <item name="colorPrimaryDark">@color/colorPrimaryDark</item>
+        <item name="colorAccent">@color/colorAccent</item>
+    </style>
+
+    <style name="AppTheme.NoActionBar" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="windowActionBar">false</item>
+        <item name="windowNoTitle">true</item>
+        <item name="android:background">@null</item>
+    </style>
+
+    <!--
+      启动主题：不用 Theme.SplashScreen。
+      它自带一段 exit 动画，会和我们在 MainActivity 里盖的覆盖层打架，顶部留下图标残影。
+      这里只把窗口底色设成和首页同色，冷启动第一帧就是干净的浅灰；
+      真正的启动图由 SplashBridge 的 ImageView 负责，前端首屏好了再淡出。
+    -->
+    <style name="AppTheme.NoActionBarLaunch" parent="AppTheme.NoActionBar">
+        <item name="android:windowBackground">@color/boot_bg</item>
+    </style>
+</resources>

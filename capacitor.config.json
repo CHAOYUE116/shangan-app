@@ -1,0 +1,16 @@
+{
+  "appId": "com.kaogong.shangan",
+  "appName": "上岸",
+  "webDir": "../webapp",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": true
+    }
+  }
+}
