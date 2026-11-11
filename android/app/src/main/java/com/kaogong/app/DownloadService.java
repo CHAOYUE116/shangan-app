@@ -54,6 +54,13 @@ public class DownloadService extends Service {
     /** 幂等启动。必须从可见界面（用户点了按钮）调用，否则 Android 12+ 会抛后台启动限制。 */
     public static void start(Context ctx, String title) {
         if (ctx == null) return;
+        // 已经在跑就别再 start 一次：重新 startForeground 会把通知栏的进度
+        // 打回「准备中 0%」，看上去就是进度条突然跳回开头
+        DownloadService s = cur;
+        if (s != null) {
+            if (title != null && !title.isEmpty()) s.title = title;
+            return;
+        }
         try {
             starting = true;
             stopWhenStarted = false;

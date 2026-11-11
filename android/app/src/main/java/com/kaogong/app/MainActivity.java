@@ -17,7 +17,8 @@ public class MainActivity extends BridgeActivity {
         try {
             // 原生 SQLite 同步桥：注入 window.NativeDB（替代 sql.js 整体加载题库，
             // 首启内存从 ~270MB 降到几十 MB；不可用时前端自动回退 sql.js）
-            NativeDbBridge nativeDb = new NativeDbBridge(this);
+            // 优先用 Application 里已经预热好的那一个，省掉一次开库（348 MB）
+            NativeDbBridge nativeDb = App.warm != null ? App.warm : new NativeDbBridge(this);
             getBridge().getWebView().addJavascriptInterface(nativeDb, "NativeDB");
             // 题库在线更新器：window.AppUpdate（下载/校验/原子替换，复用同一个 db 实例）
             getBridge().getWebView().addJavascriptInterface(new UpdateManager(this, nativeDb), "AppUpdate");

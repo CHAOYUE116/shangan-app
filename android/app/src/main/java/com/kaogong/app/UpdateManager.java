@@ -353,7 +353,13 @@ public class UpdateManager {
     public String status() {
         try {
             JSONObject o = new JSONObject();
-            o.put("state", state);
+            boolean running = worker != null && worker.isAlive();
+            // 后台还有任务在跑时，即便 state 被重置成 idle 也要如实报成 downloading，
+            // 否则前端只看到「0%」，以为没在下载
+            String st = state;
+            if (running && ("idle".equals(st) || st == null)) st = "downloading";
+            o.put("state", st);
+            o.put("running", running);
             o.put("progress", progress);
             o.put("message", message);
             o.put("remoteVersion", remoteVersion);
@@ -380,6 +386,10 @@ public class UpdateManager {
 
     @android.webkit.JavascriptInterface
     public void reset() {
+        // 正在下载时不清状态：原来这里无条件 set("idle", 0)，前端每次打开弹层都会先 reset，
+        // 结果弹层显示「0%、空进度条」，而下载其实还在后台跑（通知栏那条进度是好的）。
+        if (worker != null && worker.isAlive()) return;
+        if ("downloading".equals(appState)) return;
         set("idle", 0, "");
         remoteVersion = "";
         downloaded = 0;
