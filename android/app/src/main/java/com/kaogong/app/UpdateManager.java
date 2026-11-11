@@ -54,7 +54,22 @@ public class UpdateManager {
     private volatile long appTotal = 0;
     private volatile String appState = "idle";   // idle|downloading|done|error
 
+    /** 这次 manifest 是从哪个源拿到的（诊断用，展示在更新弹层里） */
+    private volatile String manifestSource = "";
+    /** 所有源都不通、改用了本机缓存清单 */
+    private volatile boolean usedCache = false;
+    /** 缓存清单的年龄（毫秒） */
+    private volatile long cacheAgeMs = 0;
+
     private volatile Thread worker;
+
+    /*
+     * manifest 缓存：国内到 raw.githubusercontent 时通时不通，公共反代也会 502。
+     * 只要成功拿到过一次，就把原文存到 cache 目录；下次全源失败时直接用它，
+     * 用户至少还能看到「有新版本」并从清单里的地址下，而不是一片「检查失败」。
+     */
+    private static final String CACHE_NAME = "update-manifest-cache.json";
+    private static final Object CACHE_LOCK = new Object();
 
     public UpdateManager(Context context, NativeDbBridge db) {
         this.context = context;
@@ -75,13 +90,22 @@ public class UpdateManager {
     /**
      * 进度推到通知栏。分块下载每读 128KB 就会调一次，必须按百分点节流，
      * 否则通知栏每秒刷新几十次。
+     *
+     * 另外这里必须**锁死单调不回退**：分块是 8 个线程抢着报的，重试时还会把
+     * 计数扣回去，直接透传就会出现 47% → 46% → 48% 的来回跳，看着像卡死重来。
      */
     private volatile int notiPct = -1;
+    private volatile long notiAtMs = 0;
 
     private void notifyProgress(int pct, String text) {
-        if (pct == notiPct) return;
-        notiPct = pct;
-        DownloadService.update(pct, text);
+        int p = Math.max(0, Math.min(100, pct));
+        if (notiPct >= 0 && p < notiPct) p = notiPct;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (p == notiPct && now - notiAtMs < 400) return;
+        if (now - notiAtMs < 250) return;
+        notiPct = p;
+        notiAtMs = now;
+        DownloadService.update(p, text);
     }
 
     /**
@@ -135,35 +159,71 @@ public class UpdateManager {
             localVersion = db.getDbVersion();
             // 多源并发拉 manifest，谁先回用谁；整体 12 秒封顶。
             // 串行的话：国外直连不通时，用户要盯着"正在检查更新…"等到超时。
-            final java.util.concurrent.atomic.AtomicReference<JSONObject> got =
-                    new java.util.concurrent.atomic.AtomicReference<>(null);
-            final java.util.concurrent.atomic.AtomicReference<String> err =
-                    new java.util.concurrent.atomic.AtomicReference<>("");
-            Thread[] mts = new Thread[urls.size()];
-            for (int i = 0; i < urls.size(); i++) {
-                final String u = urls.get(i);
-                mts[i] = new Thread(new Runnable() {
-                    @Override public void run() {
-                        if (got.get() != null) return;
-                        try {
-                            JSONObject m = fetchJson(u);
-                            if (m != null) got.compareAndSet(null, m);
-                        } catch (Throwable t) {
-                            err.set(t.getMessage());
-                            Log.w(TAG, "manifest 源失败 " + sourceName(u) + " : " + t.getMessage());
-                        }
+            //
+            // 但 jsDelivr 这类 CDN 有 12 小时缓存，如果和直连/反代一起赛跑，
+            // 它反而最先返回（因为快），拿到的却可能是半天前的清单 —— 于是误判"已是最新"。
+            // 所以分两波：第一波只跑无缓存的反代/直连，全挂了才上 CDN 兜底。
+            List<String> wave1 = new ArrayList<>();
+            List<String> wave2 = new ArrayList<>();
+            for (String u : urls) {
+                if (u == null || u.isEmpty()) continue;
+                if (isCdnMirror(u)) wave2.add(u); else wave1.add(u);
+            }
+            if (wave1.isEmpty()) { wave1.addAll(wave2); wave2.clear(); }
+
+            String errMsg = "";
+            ManifestHit hit;
+            if (!hasNetwork()) {
+                // 飞行模式/断网：别等 20 秒超时，直接看有没有缓存清单
+                Log.w(TAG, "设备无网络，跳过联网检查");
+                hit = new ManifestHit();
+                hit.err = "设备没有网络连接";
+            } else {
+                hit = raceManifest(wave1, 8000);
+                if (hit.json == null && !wave2.isEmpty()) {
+                    Log.w(TAG, "第一波（" + wave1.size() + " 个源）全失败，改用 CDN 兜底");
+                    ManifestHit h2 = raceManifest(wave2, 5000);
+                    if (h2.json != null) hit = h2;
+                    else errMsg = (hit.err == null ? "" : hit.err + "；") + h2.err;
+                } else {
+                    errMsg = hit.err;
+                }
+            }
+
+            JSONObject manifest = hit.json;
+            usedCache = false;
+            cacheAgeMs = 0;
+            manifestSource = hit.source == null ? "" : hit.source;
+            if (manifest != null) {
+                writeManifestCache(hit.text);
+                // CDN 有 12 小时缓存 —— 如果本机存过比它更新的清单，用缓存里的
+                if ("jsDelivr".equals(manifestSource)) {
+                    JSONObject c = readManifestCache();
+                    String cv = dbVerOf(c);
+                    String hv = dbVerOf(manifest);
+                    if (!cv.isEmpty() && !hv.isEmpty() && cmpVersion(cv, hv) > 0) {
+                        Log.w(TAG, "CDN 清单比本机缓存旧（" + hv + " < " + cv + "），改用缓存");
+                        manifest = c;
+                        usedCache = true;
+                        manifestSource = "本机缓存";
                     }
-                }, "manifest-" + i);
-                mts[i].setDaemon(true);
-                mts[i].start();
+                }
+            } else {
+                // 全源都失败 → 退到本机缓存清单，别让用户只看到一句「检查失败」
+                JSONObject cached = readManifestCache();
+                if (cached != null) {
+                    manifest = cached;
+                    usedCache = true;
+                    manifestSource = "本机缓存";
+                    Log.w(TAG, "改用本机缓存清单（" + (cacheAgeMs / 60000) + " 分钟前）：" + errMsg);
+                } else {
+                    set("error", 0, errMsg.contains("没有网络")
+                            ? "手机没联网，先连上网再检查更新"
+                            : ("更新源都连不上（试了 " + urls.size() + " 个）"
+                                + (errMsg.isEmpty() ? "" : "：" + errMsg)));
+                    return;
+                }
             }
-            long mDeadline = System.currentTimeMillis() + 12000;
-            for (Thread t : mts) {
-                long left = mDeadline - System.currentTimeMillis();
-                if (left > 0) { try { t.join(left); } catch (InterruptedException ignored) { } }
-            }
-            JSONObject manifest = got.get();
-            if (manifest == null) { set("error", 0, "所有更新源都不可达：" + err.get()); return; }
 
             JSONObject tiku = manifest.optJSONObject("tiku");
             if (tiku == null) { set("error", 0, "manifest 缺 tiku 段"); return; }
@@ -184,13 +244,16 @@ public class UpdateManager {
             }
 
             if (remoteVersion.isEmpty()) { set("error", 0, "manifest 没有 dbVersion"); return; }
-            if (!remoteVersion.equals(localVersion) && remoteVersion.compareTo(localVersion) < 0) {
-                set("uptodate", 100, "本地题库版本更新（" + localVersion + "），无需更新");
+            String cacheNote = usedCache ? "（网络不稳，用的是本机 " + cacheAgeMin() + " 分钟前的清单）" : "";
+            // 不能用 String.compareTo：按字典序 "0.5.10" 排在 "0.5.9" 前面（'1' < '9'），
+            // 那 0.5.9 → 0.5.10 这种跨位数的版本会被判成「本地更新，无需更新」。
+            if (!remoteVersion.equals(localVersion) && cmpVersion(remoteVersion, localVersion) < 0) {
+                set("uptodate", 100, "本地题库版本更新（" + localVersion + "），无需更新" + cacheNote);
                 return;
             }
             if (remoteVersion.equals(localVersion)) {
                 set("uptodate", 100, "已是最新题库 " + localVersion
-                        + (newAppAvailable ? "；发现新版 App " + newAppVersion : ""));
+                        + (newAppAvailable ? "；发现新版 App " + newAppVersion : "") + cacheNote);
                 return;
             }
 
@@ -212,16 +275,16 @@ public class UpdateManager {
                 if (!dDir.exists() && !dDir.mkdirs()) { set("error", 0, "无法创建目录"); return; }
                 File dTmp = new File(dDir, "tiku_delta.json.gz");
                 total = dSize;
-                notiPct = -1;
                 ensureNotifPermission();
                 DownloadService.start(context, "正在下载题库更新");
                 set("downloading", 0, "开始下载增量 " + humanSize(dSize));
-                String dGot = download(dUrls, dTmp, dSha, dSize);
+                long dRaw = deltaEntry.optLong("rawSize", 0);
+                String dGot; synchronized (DL_LOCK) { dGot = download(dUrls, dTmp, dSha, dSize, dRaw); }
                 if (dGot == null) return;
                 set("verifying", 100, "校验中…");
                 if (!dSha.isEmpty() && !dSha.equalsIgnoreCase(dGot)) {
                     dTmp.delete();
-                    set("error", 0, "增量包校验失败，已丢弃");
+                    set("error", 0, "增量包校验失败，已丢弃（期望 " + shortSha(dSha) + " 实际 " + shortSha(dGot) + "，大小 " + humanSize(dTmp.length()) + "）");
                     return;
                 }
                 pendingPath = dTmp.getAbsolutePath();
@@ -242,12 +305,10 @@ public class UpdateManager {
             File dir = new File(context.getFilesDir(), "db");
             if (!dir.exists() && !dir.mkdirs()) { set("error", 0, "无法创建目录"); return; }
             File tmp = new File(dir, "tiku_app.db.download");
-
-            notiPct = -1;
             ensureNotifPermission();
             DownloadService.start(context, "正在下载题库");
             set("downloading", 0, "开始下载 " + humanSize(total));
-            String gotSha = download(fUrls, tmp, sha, total);
+            String gotSha; synchronized (DL_LOCK) { gotSha = download(fUrls, tmp, sha, total, full.optLong("rawSize", 0)); }
             if (gotSha == null) return;   // download() 内已 set error
 
             set("verifying", 100, "校验中…");
@@ -308,6 +369,9 @@ public class UpdateManager {
             o.put("newAppProgress", appProgress);
             o.put("newAppDownloaded", appDownloaded);
             o.put("newAppTotal", appTotal);
+            o.put("manifestSource", manifestSource);
+            o.put("cachedManifest", usedCache);
+            o.put("cacheAgeMin", usedCache ? cacheAgeMin() : 0);
             return o.toString();
         } catch (Throwable t) {
             return "{\"state\":\"error\",\"message\":\"" + t.getMessage() + "\"}";
@@ -330,7 +394,79 @@ public class UpdateManager {
 
     // ---------------- 内部工具 ----------------
 
-    private JSONObject fetchJson(String url) throws Exception {
+    /** 一个 manifest 源的命中结果 */
+    private static final class ManifestHit {
+        JSONObject json;
+        String text;
+        String source;
+        String err;
+    }
+
+    /** jsDelivr 这类 CDN 有 12 小时缓存，只能兜底，不能和直连一起赛跑 */
+    private static boolean isCdnMirror(String u) {
+        String s = u.toLowerCase();
+        return s.contains("jsdelivr");
+    }
+
+    /** 系统有没有可用网络（飞行模式、断网时不用白等超时） */
+    private boolean hasNetwork() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            android.net.Network n = cm.getActiveNetwork();
+            if (n == null) return false;
+            android.net.NetworkCapabilities c = cm.getNetworkCapabilities(n);
+            return c != null && c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Throwable t) {
+            return true;   // 判断不出来就当有网，交给正常流程去试
+        }
+    }
+
+    /** 并发跑一组 manifest 源，先成功者胜；budgetMs 到点就收 */
+    private ManifestHit raceManifest(List<String> urls, long budgetMs) {
+        ManifestHit out = new ManifestHit();
+        if (urls == null || urls.isEmpty()) return out;
+        final java.util.concurrent.atomic.AtomicReference<ManifestHit> got =
+                new java.util.concurrent.atomic.AtomicReference<>(null);
+        final java.util.concurrent.atomic.AtomicReference<String> lastErr =
+                new java.util.concurrent.atomic.AtomicReference<>("");
+        Thread[] ts = new Thread[urls.size()];
+        for (int i = 0; i < urls.size(); i++) {
+            final String u = urls.get(i);
+            ts[i] = new Thread(new Runnable() {
+                @Override public void run() {
+                    if (got.get() != null) return;
+                    try {
+                        String text = fetchText(u);
+                        JSONObject m = new JSONObject(text);
+                        ManifestHit h = new ManifestHit();
+                        h.json = m;
+                        h.text = text;
+                        h.source = sourceName(u);
+                        got.compareAndSet(null, h);
+                    } catch (Throwable t) {
+                        lastErr.set(sourceName(u) + " " + t.getMessage());
+                        Log.w(TAG, "manifest 源失败 " + sourceName(u) + " : " + t.getMessage());
+                    }
+                }
+            }, "manifest-" + i);
+            ts[i].setDaemon(true);
+            ts[i].start();
+        }
+        long deadline = System.currentTimeMillis() + budgetMs;
+        // 不能 join 所有线程：慢源会把整个检查拖到 12 秒（就算快源 1 秒就回了）。
+        // 改成轮询 got，谁先回立刻返回。
+        while (got.get() == null && System.currentTimeMillis() < deadline) {
+            try { Thread.sleep(120); } catch (InterruptedException ignored) { break; }
+        }
+        ManifestHit w = got.get();
+        if (w != null) return w;
+        out.err = lastErr.get();
+        return out;
+    }
+
+    private String fetchText(String url) throws Exception {
         HttpURLConnection c = open(url);
         c.setConnectTimeout(8000);      // manifest 就几 KB，等不了那么久
         c.setReadTimeout(10000);
@@ -339,11 +475,81 @@ public class UpdateManager {
             byte[] buf = new byte[8192];
             int n;
             while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
-            return new JSONObject(bo.toString("UTF-8"));
+            return bo.toString("UTF-8");
         } finally {
             c.disconnect();
         }
     }
+
+    private JSONObject fetchJson(String url) throws Exception {
+        return new JSONObject(fetchText(url));
+    }
+
+    // ---------------- manifest 本机缓存 ----------------
+
+    private File manifestCacheFile() {
+        return new File(context.getCacheDir(), CACHE_NAME);
+    }
+
+    private void writeManifestCache(String text) {
+        if (text == null || text.length() < 20) return;
+        synchronized (CACHE_LOCK) {
+            File dst = manifestCacheFile();
+            File tmp = new File(dst.getAbsolutePath() + ".tmp");
+            try (FileOutputStream fo = new FileOutputStream(tmp)) {
+                fo.write(text.getBytes("UTF-8"));
+                fo.getFD().sync();
+            } catch (Throwable t) {
+                Log.w(TAG, "写 manifest 缓存失败：" + t.getMessage());
+                return;
+            }
+            if (!tmp.renameTo(dst)) {
+                // 某些机型 rename 会失败（跨挂载点/文件被占），退成「先删再改名」
+                //noinspection ResultOfMethodCallIgnored
+                dst.delete();
+                if (!tmp.renameTo(dst)) {
+                    //noinspection ResultOfMethodCallIgnored
+                    tmp.delete();
+                    Log.w(TAG, "manifest 缓存改名失败");
+                }
+            }
+        }
+    }
+
+    private JSONObject readManifestCache() {
+        synchronized (CACHE_LOCK) {
+            File f = manifestCacheFile();
+            if (!f.exists()) return null;
+            long age = System.currentTimeMillis() - f.lastModified();
+            // 超过 30 天的清单没有意义了（版本号早就变了），宁可直接报错
+            if (age > 30L * 24 * 3600 * 1000) return null;
+            try {
+                java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                try (InputStream in = new java.io.FileInputStream(f)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                }
+                JSONObject o = new JSONObject(bo.toString("UTF-8"));
+                cacheAgeMs = age;
+                return o;
+            } catch (Throwable t) {
+                Log.w(TAG, "读 manifest 缓存失败：" + t.getMessage());
+                return null;
+            }
+        }
+    }
+
+    private long cacheAgeMin() {
+        return Math.max(1, cacheAgeMs / 60000);
+    }
+
+    private static String dbVerOf(JSONObject m) {
+        if (m == null) return "";
+        JSONObject t = m.optJSONObject("tiku");
+        return t == null ? "" : t.optString("dbVersion", "");
+    }
+
 
     /** 下载并返回 sha256；失败返回 null（已 set error）。 */
     /* ---------- 下载：多线程分块 ---------- */
@@ -358,6 +564,9 @@ public class UpdateManager {
 
     /** 界面可见的已下载字节，只增不减（块重试会回滚实际字节，但进度条不该倒退） */
     private volatile long shown = 0;
+
+    /** 同一时刻只允许一条下载线占着通知栏，否则两个百分比互相覆盖 */
+    private static final Object DL_LOCK = new Object();
     private static final long DL_PARALLEL_MIN = 2L * 1024 * 1024;   // 小于 2MB 单流就够
 
     /* ================= 下载源选择 ================= */
@@ -409,6 +618,7 @@ public class UpdateManager {
     private static String sourceName(String url) {
         if (url == null || url.isEmpty()) return "未知源";
         if (url.contains("gh-proxy") || url.contains("ghproxy")) return "加速镜像";
+        if (url.contains("gitmirror")) return "镜像 gitmirror";
         if (url.contains("jsdelivr")) return "jsDelivr";
         if (url.contains("githubusercontent") || url.contains("github.com")) return "直连 GitHub";
         try { return new java.net.URL(url).getHost(); } catch (Throwable t) { return "自定义源"; }
@@ -494,7 +704,7 @@ public class UpdateManager {
     }
 
     /** 多源下载：按测速顺序逐个试，第一个成功的胜出 */
-    private String download(String[] urls, File dest, String expectSha, long sizeHint) {
+    private String download(String[] urls, File dest, String expectSha, long sizeHint, long rawHint) {
         String[] ordered = orderSources(urls);
         if (ordered.length == 0) {
             set("error", progress, "manifest 里没有可用的下载地址");
@@ -505,15 +715,15 @@ public class UpdateManager {
             if (u == null || u.isEmpty()) continue;
             message = "正在从「" + sourceName(u) + "」下载";
             Log.i(TAG, "下载源 " + sourceName(u) + " " + u);
-            String r = downloadOne(u, dest, expectSha, sizeHint);
+            String r = downloadOne(u, dest, expectSha, sizeHint, rawHint);
             if (r != null) return r;
-            lastErr = sourceName(u);
+            lastErr = sourceName(u);          // 换源等于重新开始，允许进度条回到 0
         }
         set("error", progress, "所有下载源都失败（最后一个：" + lastErr + "）");
         return null;
     }
 
-    private String downloadOne(String url, File dest, String expectSha, long sizeHint) {
+    private String downloadOne(String url, File dest, String expectSha, long sizeHint, long rawHint) {
         HttpURLConnection c = null;
         try {
             boolean isGz = url.endsWith(".gz");
@@ -525,9 +735,16 @@ public class UpdateManager {
                 downloaded = 0;
                 shown = 0;
                 parts = fetchParts(url, size, dest.getParentFile(), dest.getName() + "." + size + ".part", false);
+                // 分块失败不再直接判死：弱网/代理下经常是个别分块连续三次超时。
+                // 退回单线程整取下完再解压——慢一点但成功率最高；进度条有单调保护，
+                // 不会因为「单线程从头数」而往回跳。
+                if (parts == null) {
+                    Log.w(TAG, "分块下载未完成，改用单线程整取");
+                    message = "分块失败，改用单线程重下…";
+                }
             }
             if (parts != null) {
-                if (!assemble(parts, dest, isGz)) throw new java.io.IOException("分块合并失败");
+                if (!assemble(parts, dest, isGz, rawHint, false)) throw new java.io.IOException("分块合并失败");
             } else {
                 c = open(url);
                 long len = c.getContentLengthLong();
@@ -545,11 +762,11 @@ public class UpdateManager {
                     got += n;
                     downloaded = got;
                     if (total > 0) {
-                        int pct = (int) Math.min(99, got * 100 / total);
+                        int pct = (int) Math.min(96, got * 100 / total);
                         if (pct != lastPct) {
                             lastPct = pct;
-                            progress = pct;
-                            message = "下载中 " + pct + "%  " + humanSize(got) + " / " + humanSize(total);
+                            progress = Math.max(progress, pct);
+                            message = (isGz ? "正在下载并解压 " : "下载中 ") + pct + "%  " + humanSize(got) + " / " + humanSize(total);
                             notifyProgress(pct, humanSize(got) + " / " + humanSize(total));
                         }
                     }
@@ -559,7 +776,7 @@ public class UpdateManager {
             }
 
             // 校验的是"解压后"的库文件
-            return sha256Of(dest);
+            return sha256Of(dest, dest.length(), false);
         } catch (Throwable t) {
             if (dest.exists()) dest.delete();
             Log.w(TAG, "源 " + sourceName(url) + " 下载失败：" + t.getMessage());
@@ -570,12 +787,50 @@ public class UpdateManager {
         }
     }
 
-    private String sha256Of(File f) throws Exception {
+    /**
+     * 版本号比较：形如 0.5.10-20261110-1010。
+     * 前半段按 . 分段做数值比较（0.5.10 > 0.5.9），相同时再比后半段时间戳。
+     */
+    private static int cmpVersion(String a, String b) {
+        String[] pa = a.split("-", 2);
+        String[] pb = b.split("-", 2);
+        String[] na = pa[0].split("\\.");
+        String[] nb = pb[0].split("\\.");
+        int n = Math.max(na.length, nb.length);
+        for (int i = 0; i < n; i++) {
+            int va = i < na.length ? parseIntSafe(na[i]) : 0;
+            int vb = i < nb.length ? parseIntSafe(nb[i]) : 0;
+            if (va != vb) return va < vb ? -1 : 1;
+        }
+        String ta = pa.length > 1 ? pa[1] : "";
+        String tb = pb.length > 1 ? pb[1] : "";
+        return ta.compareTo(tb);
+    }
+
+    private static int parseIntSafe(String s) {
+        try { return Integer.parseInt(s.trim()); } catch (Exception e) { return 0; }
+    }
+
+    /** 算 sha256。total>0 时顺带把 99→100 这段进度推出去，免得校验那几秒又像卡死 */
+    private String sha256Of(File f, long totalBytes, boolean forApp) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
+        long done = 0;
+        long lastReport = 0;
         try (InputStream in = new java.io.FileInputStream(f)) {
             byte[] b = new byte[256 * 1024];
             int k;
-            while ((k = in.read(b)) > 0) md.update(b, 0, k);
+            while ((k = in.read(b)) > 0) {
+                md.update(b, 0, k);
+                done += k;
+                if (totalBytes <= 0) continue;
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastReport < 300) continue;
+                lastReport = now;
+                int pct = (int) (done >= totalBytes ? 100 : 99);
+                String txt = "正在校验 " + humanSize(done) + " / " + humanSize(totalBytes);
+                if (forApp) { appProgress = pct; } else { progress = pct; message = txt; }
+                notifyProgress(pct, txt);
+            }
         }
         return hex(md.digest());
     }
@@ -604,17 +859,57 @@ public class UpdateManager {
      * 每块走新连接反而快。单块失败重试 3 次；任一块最终失败整体返回 null，调用方回退单流。
      */
     private File[] fetchParts(String url, long size, File dir, String prefix, final boolean forApp) {
-        final long CHUNK = 4L * 1024 * 1024;
+        final long CHUNK = 2L * 1024 * 1024;
         final int blocks = (int) ((size + CHUNK - 1) / CHUNK);
         if (blocks < 2) return null;
-        final int workers = Math.min(DL_THREADS, blocks);
+        final int workers = Math.min(4, blocks);
         final File[] parts = new File[blocks];
         for (int i = 0; i < blocks; i++) parts[i] = new File(dir, prefix + i);
+
+        // 续传标记：只有「同一个包」的残留分块才允许复用。
+        // 以前一律复用，上一次失败的残片会被当成已完成（done 一次性加满），
+        // 进度条就出现「一直 0，然后突然蹦到 70%」——现在换包先清干净。
+        File marker = new File(dir, prefix + ".src");
+        String sig = url + "#" + size;
+        String oldSig = null;
+        try {
+            if (marker.exists()) oldSig = new String(java.nio.file.Files.readAllBytes(marker.toPath()), "UTF-8");
+        } catch (Throwable ignored) { }
+        if (!sig.equals(oldSig)) {
+            for (File f : parts) { if (f != null && f.exists()) f.delete(); }
+            try { java.nio.file.Files.write(marker.toPath(), sig.getBytes("UTF-8")); } catch (Throwable ignored) { }
+        }
+        final File markerFile = marker;
 
         final long fTotal = size;
         final java.util.concurrent.atomic.AtomicLong done = new java.util.concurrent.atomic.AtomicLong(0);
         final java.util.concurrent.atomic.AtomicInteger next = new java.util.concurrent.atomic.AtomicInteger(0);
         final java.util.concurrent.atomic.AtomicBoolean bad = new java.util.concurrent.atomic.AtomicBoolean(false);
+        // 心跳：只要 9 秒没有新字节就换文案，让人知道它在重试而不是死了
+        final Thread beat = new Thread(new Runnable() {
+            @Override public void run() {
+                long lastSeen = -1;
+                int sameFor = 0;
+                while (!Thread.currentThread().isInterrupted()) {
+                    try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+                    long d = done.get();
+                    // 失败重试会把计数扣回去，这里用「已完成过的最高水位」展示，
+                    // 免得状态栏从 13.7MB 突然跳回 0 KB，看着像进度倒退
+                    if (d > shown) shown = d;
+                    if (d == lastSeen) sameFor++; else { sameFor = 0; lastSeen = d; }
+                    if (sameFor >= 12) { bad.set(true); return; }  // 36 秒无进展：换源/降级
+                    if (sameFor >= 3 && shown < fTotal) {
+                        int pct = (int) Math.min(92, shown * 100 / Math.max(1, fTotal));
+                        String txt = "网络有点慢，正在重试 " + humanSize(shown) + " / " + humanSize(fTotal);
+                        if (forApp) { appDownloaded = shown; appTotal = fTotal; } else { downloaded = shown; message = txt; }
+                        notifyProgress(pct, txt);
+                    }
+                    if (d >= fTotal) return;
+                }
+            }
+        });
+        beat.setDaemon(true);
+        beat.start();
         Thread[] ts = new Thread[workers];
         for (int i = 0; i < workers; i++) {
             ts[i] = new Thread(new Runnable() {
@@ -628,7 +923,7 @@ public class UpdateManager {
                         if (parts[b].exists() && parts[b].length() == need) {
                             long d = done.addAndGet(need);
                             if (d > shown) shown = d;
-                            int pct = (int) Math.min(99, shown * 100 / Math.max(1, fTotal));
+                            int pct = (int) Math.min(92, shown * 100 / Math.max(1, fTotal));
                             if (forApp) { appProgress = pct; appDownloaded = shown; appTotal = fTotal; }
                             else { progress = pct; downloaded = shown; }
                             notifyProgress(pct, humanSize(shown) + " / " + humanSize(fTotal));
@@ -645,6 +940,7 @@ public class UpdateManager {
             ts[i].start();
         }
         for (Thread t : ts) { try { t.join(); } catch (InterruptedException ignored) { } }
+        beat.interrupt();
 
         boolean ok = !bad.get();
         if (ok) {
@@ -655,6 +951,7 @@ public class UpdateManager {
             }
         }
         if (!ok) { for (File f : parts) { if (f != null) f.delete(); } return null; }
+        if (markerFile != null) markerFile.delete();
         return parts;
     }
 
@@ -664,7 +961,9 @@ public class UpdateManager {
         HttpURLConnection hc = null;
         FileOutputStream out = null;
         InputStream in = null;
+        final long need = to - from + 1;
         long wrote = 0;
+        boolean counted = false;
         try {
             hc = open(url);
             hc.setRequestProperty("Range", "bytes=" + from + "-" + to);
@@ -674,12 +973,16 @@ public class UpdateManager {
             out = new FileOutputStream(target);
             byte[] buf = new byte[128 * 1024];
             int k;
+            long blockStart = System.currentTimeMillis();
             while ((k = in.read(buf)) > 0) {
                 out.write(buf, 0, k);
                 wrote += k;
+                // 单块拖过 20 秒还没下完，大概率是这条连接被限速/挂住了。
+                // 断开换一条新连接重来，比让进度条干等强 —— 实测 gh-proxy 后半程经常这样
+                if (wrote < need && System.currentTimeMillis() - blockStart > 20000) return false;
                 long d = done.addAndGet(k);
                 if (d > shown) shown = d;
-                int pct = (int) Math.min(99, shown * 100 / Math.max(1, fTotal));
+                int pct = (int) Math.min(92, shown * 100 / Math.max(1, fTotal));
                 if (forApp) {
                     appProgress = pct;
                     appDownloaded = shown;
@@ -692,11 +995,17 @@ public class UpdateManager {
                     notifyProgress(pct, humanSize(shown) + " / " + humanSize(fTotal) + "（" + workers + " 线程）");
                 }
             }
-            return target.length() == (to - from + 1);
+            boolean okLen = target.length() == need;
+            if (okLen) {
+                // 补齐这一块的整段字节（read 循环里只加了 wrote）
+                done.addAndGet(need - wrote);
+                counted = true;
+            }
+            return okLen;
         } catch (Throwable t) {
             return false;
         } finally {
-            done.addAndGet(-wrote);
+            if (!counted) done.addAndGet(-wrote);
             try { if (out != null) out.close(); } catch (Throwable ignored) { }
             try { if (in != null) in.close(); } catch (Throwable ignored) { }
             if (hc != null) hc.disconnect();
@@ -704,7 +1013,7 @@ public class UpdateManager {
     }
 
     /** 按序拼接分块；gz 的话边拼边解压。无论成败都会清掉分块文件 */
-    private boolean assemble(File[] parts, File dest, boolean isGz) {
+    private boolean assemble(File[] parts, File dest, boolean isGz, long rawHint, boolean forApp) {
         List<InputStream> list = new ArrayList<InputStream>();
         FileOutputStream out = null;
         InputStream in = null;
@@ -715,7 +1024,33 @@ public class UpdateManager {
             out = new FileOutputStream(dest);
             byte[] buf = new byte[256 * 1024];
             int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            long written = 0;
+            long lastReport = 0;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                written += n;
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastReport < 300) continue;
+                lastReport = now;
+                int pct = rawHint > 0
+                        ? (int) Math.min(99, 92 + written * 7 / Math.max(1, rawHint))
+                        : 95;
+                // 文案必须说清「这是在本机解压安装，不是又下载一遍」：
+                // 之前只写「正在解压 X / 394 MB」，用户以为下完 106MB 又要下 300 多 MB。
+                String txt = (isGz ? "正在安装（解压）" : "正在写入") + " " + humanSize(written)
+                        + (rawHint > 0 ? " / " + humanSize(rawHint) : "") + "，不用再下载";
+                if (forApp) {
+                    appProgress = pct;
+                    appDownloaded = written;
+                    if (rawHint > 0) appTotal = rawHint;
+                } else {
+                    progress = pct;
+                    downloaded = written;
+                    if (rawHint > 0) total = rawHint;
+                    message = txt;
+                }
+                notifyProgress(pct, txt);
+            }
             return true;
         } catch (Throwable t) {
             return false;
@@ -770,18 +1105,20 @@ public class UpdateManager {
                 String apkUrl = pickSource(newAppSources.length > 0 ? newAppSources : new String[]{newAppUrl});
                 if (apkUrl.isEmpty()) throw new Exception("没有可用的下载源");
                 // 到这一步才确定要真下载了，此时再起前台服务
-                notiPct = -1;
                 ensureNotifPermission();
                 DownloadService.start(context, "正在下载新版 App");
                 appState = "downloading";
                 message = "正在从「" + sourceName(apkUrl) + "」下载 App";
                 long size = newAppSize > 0 ? newAppSize : remoteSize(apkUrl);
                 if (size > 0) appTotal = size;
-                File[] parts = size >= DL_PARALLEL_MIN
-                        ? fetchParts(apkUrl, size, context.getCacheDir(), "shangan-update.apk." + size + ".part", true)
-                        : null;
+                File[] parts = null;
+                synchronized (DL_LOCK) {
+                    parts = size >= DL_PARALLEL_MIN
+                            ? fetchParts(apkUrl, size, context.getCacheDir(), "shangan-update.apk." + size + ".part", true)
+                            : null;
+                }
                 if (parts != null) {
-                    if (!assemble(parts, out, false)) throw new Exception("分块合并失败");
+                    if (!assemble(parts, out, false, 0, true)) throw new Exception("分块合并失败");
                 } else {
                     HttpURLConnection c = open(apkUrl);
                     c.connect();
@@ -808,7 +1145,7 @@ public class UpdateManager {
                         c.disconnect();
                     }
                 }
-                if (!newAppSha.isEmpty() && !sha256Of(out).equalsIgnoreCase(newAppSha)) {
+                if (!newAppSha.isEmpty() && !sha256Of(out, out.length(), true).equalsIgnoreCase(newAppSha)) {
                     out.delete();
                     stamp.delete();
                     appState = "error";
@@ -929,7 +1266,7 @@ public class UpdateManager {
     private HttpURLConnection open(String url) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(15000);
-        c.setReadTimeout(60000);
+        c.setReadTimeout(15000);
         c.setInstanceFollowRedirects(true);   // GitHub Release 会 302 到 CDN
         c.setRequestProperty("User-Agent", "shangan-app/update");
         return c;
@@ -981,7 +1318,7 @@ public class UpdateManager {
     }
 
     private static String humanSize(long n) {
-        if (n <= 0) return "?";
+        if (n <= 0) return "0 KB";
         if (n < 1024 * 1024) return (n / 1024) + " KB";
         return String.format("%.1f MB", n / 1024.0 / 1024.0);
     }
