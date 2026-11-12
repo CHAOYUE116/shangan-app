@@ -33,6 +33,14 @@ import java.util.zip.GZIPInputStream;
  */
 public class NativeDbBridge {
 
+    /**
+     * assets 里题库文件所在目录。
+     * 2026-11-12：原来读写 {@code public/app-assets/}，可 WebView 侧只需要那几张 skill-*.json，
+     * 把 400 MB 的 .db 也塞进 public/ 会让 APK 里出现两份库（一份给桥读、一份被 WebView
+     * 目录镜像进来），包体直接涨到 299 MB。改成 assets 根目录后只有一份。
+     */
+    private static final String DB_ASSET_DIR = "";
+
     private final Context context;
 
     // 首次启动要把 assets 里的题库解压到 files/db/：tiku_app.db 332 MB + images.db 76 MB，
@@ -69,7 +77,7 @@ public class NativeDbBridge {
             // 后两个数是为了防「版本号写着新的、库里数据还是旧的」——
             // 覆盖安装 / 增量包写一半 / 用户改过库，都会让版本号和内容脱节，
             // 表现出来就是「更新完题库，题反而变少了」。
-            String assetTxt = readAssetText("public/app-assets/db-version.txt");
+            String assetTxt = readAssetText(DB_ASSET_DIR + "db-version.txt");
             String[] parts = assetTxt.trim().split("\\s+");
             String assetVer = parts.length > 0 ? parts[0] : "";
             int expectQ = 0, expectQc = 0;
@@ -81,7 +89,7 @@ public class NativeDbBridge {
             // 这样启动耗时从「408 MB 解压写出」降到「332 MB」，少约 19%。
             copyTotal = 332L * 1024 * 1024;
             copyBytes = 0;
-            File f = copyAssetIfNeeded("public/app-assets/tiku_app.db", "tiku_app.db",
+            File f = copyAssetIfNeeded(DB_ASSET_DIR + "tiku_app.db", "tiku_app.db",
                     assetVer, true, expectQ, expectQc);
             tikuDb = SQLiteDatabase.openDatabase(f.getAbsolutePath(), null,
                     SQLiteDatabase.OPEN_READONLY | SQLiteDatabase.NO_LOCALIZED_COLLATORS);
@@ -105,7 +113,7 @@ public class NativeDbBridge {
 
     private synchronized void ensureImages() throws Exception {
         if (imagesDb != null && imagesDb.isOpen()) return;
-        File f = copyAssetIfNeeded("public/app-assets/images.db", "images.db", null, false);
+        File f = copyAssetIfNeeded(DB_ASSET_DIR + "images.db", "images.db", null, false);
         imagesDb = SQLiteDatabase.openDatabase(f.getAbsolutePath(), null,
                 SQLiteDatabase.OPEN_READONLY | SQLiteDatabase.NO_LOCALIZED_COLLATORS);
     }
@@ -473,6 +481,12 @@ public class NativeDbBridge {
         } catch (Throwable t) {
             return errorJson(t);
         }
+    }
+
+    /** 当前构建的 flavor（prod / lab）。实验版前端靠它决定要不要加载实验室与能力引擎。 */
+    @JavascriptInterface
+    public String flavor() {
+        return BuildConfig.FLAVOR;
     }
 
     /** 按 SQL 内容路由到对应库（images 表 → images.db，其余 → tiku_app.db）。 */
