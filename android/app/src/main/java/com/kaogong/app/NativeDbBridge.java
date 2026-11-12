@@ -113,10 +113,42 @@ public class NativeDbBridge {
 
     private synchronized void ensureImages() throws Exception {
         if (imagesDb != null && imagesDb.isOpen()) return;
-        File f = copyAssetIfNeeded(DB_ASSET_DIR + "images.db", "images.db", null, false);
+        // 图片库以前传的是 null 版本号：只要本地文件在就永远不重拷，
+        // 结果每次升级新增的公式图都进不来（用户看到的还是「图打不开」）。
+        // 现在跟题库用同一个版本号：版本不同就把旧的删掉重拷。
+        String ver = assetDbVersion();
+        if (ver != null) {
+            File dir0 = new File(context.getFilesDir(), "db");
+            File verFile = new File(dir0, "images.db.ver");
+            String local = verFile.exists() ? readText(verFile).trim() : "";
+            if (!local.equals(ver)) {
+                File img = new File(dir0, "images.db");
+                if (img.exists() && !img.delete()) android.util.Log.w("NativeDB", "旧图片库删不掉");
+                if (verFile.exists()) verFile.delete();
+            }
+        }
+        File f = copyAssetIfNeeded(DB_ASSET_DIR + "images.db", "images.db", ver, false);
         imagesDb = SQLiteDatabase.openDatabase(f.getAbsolutePath(), null,
                 SQLiteDatabase.OPEN_READONLY | SQLiteDatabase.NO_LOCALIZED_COLLATORS);
     }
+
+    /** assets 里带的题库版本（db-version.txt 首段），读不到返回 null。 */
+    private String assetDbVersion() {
+        if (cachedAssetVer != null) return cachedAssetVer.isEmpty() ? null : cachedAssetVer;
+        String v = "";
+        try (java.io.InputStream in = context.getAssets().open("db-version.txt")) {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] b = new byte[256];
+            int n;
+            while ((n = in.read(b)) > 0) bos.write(b, 0, n);
+            String[] parts = new String(bos.toByteArray(), "UTF-8").trim().split("\\s+");
+            v = parts.length > 0 ? parts[0].trim() : "";
+        } catch (Throwable ignored) {}
+        cachedAssetVer = v;
+        return v.isEmpty() ? null : v;
+    }
+
+    private static String cachedAssetVer = null;
 
     /** 当前生效的题库版本（私有目录记录，没有则返回空串）。 */
     @JavascriptInterface
