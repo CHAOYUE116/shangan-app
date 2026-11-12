@@ -7,8 +7,8 @@ android {
         applicationId "com.kaogong.shangan"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 93
-        versionName "0.5.3"
+        versionCode 99
+        versionName "0.6.2"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -27,6 +27,20 @@ android {
                 keyAlias 'kaogong'
                 keyPassword pass
             }
+        }
+    }
+    // prod = 正式版；lab = 自学习引擎测试版，包名多一个 .lab，可以和正式版并排装
+    flavorDimensions "mode"
+    productFlavors {
+        prod {
+            dimension "mode"
+        }
+        lab {
+            dimension "mode"
+            applicationIdSuffix ".lab"
+            versionNameSuffix "-lab"
+            resValue "string", "app_name", "上岸实验室"
+            resValue "string", "title_activity_main", "上岸实验室"
         }
     }
     buildTypes {
