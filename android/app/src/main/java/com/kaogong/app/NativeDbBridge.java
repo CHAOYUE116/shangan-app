@@ -654,12 +654,11 @@ public class NativeDbBridge {
                     }
                 }
                 if (contentOk) {
-                    // 内容和 assets 一致，就不再因为版本号落后而整块重拷
-                    if (!localVer.isEmpty() && localVer.compareTo(assetVersion) < 0) {
-                        android.util.Log.i("NativeDB", "本地题库 " + localVer
-                                + " 落后于 assets " + assetVersion + "，本次跳过重拷，走增量");
-                    }
-                    return target;
+                    // 行数一样不代表内容一样：q_bad 打标、材料回填、解析覆盖都不会改行数。
+                    // 所以只有版本号也相同才敢跳过；版本不同一律重拷（宁可多拷一次，也别让用户带着旧数据）。
+                    if (localVer.equals(assetVersion)) return target;
+                    android.util.Log.i("NativeDB", "本地题库 " + localVer + " ≠ assets " + assetVersion
+                            + "（行数相同但内容可能已修），重拷");
                 }
             }
         }
